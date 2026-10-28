@@ -3,9 +3,13 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { appError, err, ok, type Result } from '@lnwjud/domain';
+import { workspaceRootsOverlap } from './workspace-write-scope.js';
 
 export interface WorkspaceWriterGlobalExclusion {
+  resolveWorkspaceRoot?(workspaceId: string): Promise<string | undefined>;
+  resolveMutationRoot?(workspaceId: string, paths?: readonly string[]): Promise<string | undefined>;
   holdExclusiveProbe(workspaceId: string): Promise<Result<{
+    readonly workspaceRoot?: string;
     releaseAfterVerifiedTermination(): Promise<void>;
   }>>;
 }
@@ -48,7 +52,7 @@ interface CallRow { call_id: string; pid: number; generation: number; }
 export interface WorkspaceWriterLeasePort {
   acquire(workspaceId: string, ownerClientId: string, ownerSessionId: string, ttlSeconds: number, recoverAbandonedSameClient?: boolean): Promise<Result<WorkspaceWriterLeaseProof & { expiresAt: string }>>;
   inspect(workspaceId: string): Promise<Result<WorkspaceWriterLeaseStatus>>;
-  begin(workspaceId: string, ownerClientId: string, ownerSessionId: string, callId: string, proof?: WorkspaceWriterLeaseProof): Promise<Result<{ required: boolean; generation: number }>>;
+  begin(workspaceId: string, ownerClientId: string, ownerSessionId: string, callId: string, proof?: WorkspaceWriterLeaseProof, paths?: readonly string[]): Promise<Result<{ required: boolean; generation: number }>>;
   heartbeat(workspaceId: string, callId: string, generation: number): Promise<void>;
   end(workspaceId: string, callId: string, generation: number): Promise<void>;
   renew(workspaceId: string, ownerClientId: string, ownerSessionId: string, proof: WorkspaceWriterLeaseProof, ttlSeconds: number): Promise<Result<{ expiresAt: string }>>;
@@ -72,6 +76,10 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
       if (!columns.some((column) => column.name === 'last_activity_at')) {
         db.exec('ALTER TABLE workspace_writer_leases ADD COLUMN last_activity_at INTEGER NOT NULL DEFAULT 0');
       }
+      for (const table of ['workspace_writer_leases', 'workspace_writer_calls']) {
+        const fields = db.prepare(`PRAGMA table_info(${table})`).all();
+        if (!fields.some((field) => field.name === 'workspace_root')) db.exec(`ALTER TABLE ${table} ADD COLUMN workspace_root TEXT`);
+      }
     });
   }
 
@@ -80,15 +88,17 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
     const globalProbe = this.globalExclusion === undefined ? undefined
       : await this.globalExclusion.holdExclusiveProbe(workspaceId).catch(() => unavailable());
     if (globalProbe !== undefined && !globalProbe.ok) return globalProbe;
+    const workspaceRoot = globalProbe?.ok ? globalProbe.value.workspaceRoot : undefined;
     try {
       return this.transaction((db) => {
         const row = this.row(db, workspaceId);
         const now = this.now();
+        if (this.hasOverlappingWriter(db, workspaceId, workspaceRoot)) return conflict('An overlapping or unscoped workspace writer holds admission');
         if (row?.lease_id !== null && row?.lease_id !== undefined && row.expires_at > now) {
-          // Explicit same-client recovery revokes an idle session. Generation fencing
-          // prevents any previous proof from authorizing later mutations.
+          // Stateless HTTP can reuse an endpoint session after losing its proof.
+          // Explicit idle recovery rotates the fence even for that same session.
           if (!recoverAbandonedSameClient || row.owner_client_id !== clientId
-            || row.owner_session_id === sessionId || row.last_activity_at <= 0
+            || row.last_activity_at <= 0
             || now - row.last_activity_at < 60_000) {
             return conflict('Workspace writer lease is active; same-client idle recovery is not eligible');
           }
@@ -100,12 +110,12 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
         const leaseToken = randomUUID() + randomUUID();
         const expiry = now + ttlSeconds * 1000;
         db.prepare(`INSERT INTO workspace_writer_leases
-          (workspace_id,generation,lease_id,token_hash,owner_client_id,owner_session_id,expires_at,last_activity_at)
-          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET
+          (workspace_id,generation,lease_id,token_hash,owner_client_id,owner_session_id,expires_at,last_activity_at,workspace_root)
+          VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id) DO UPDATE SET
           generation=excluded.generation,lease_id=excluded.lease_id,token_hash=excluded.token_hash,
           owner_client_id=excluded.owner_client_id,owner_session_id=excluded.owner_session_id,
-          expires_at=excluded.expires_at,last_activity_at=excluded.last_activity_at`)
-          .run(workspaceId, generation, leaseId, digest(leaseToken), clientId, sessionId, expiry, now);
+          expires_at=excluded.expires_at,last_activity_at=excluded.last_activity_at,workspace_root=excluded.workspace_root`)
+          .run(workspaceId, generation, leaseId, digest(leaseToken), clientId, sessionId, expiry, now, workspaceRoot ?? null);
         return ok({ leaseId, leaseToken, generation, expiresAt: new Date(expiry).toISOString() });
       });
     } catch { return unavailable(); }
@@ -139,22 +149,24 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
   }
 
   /** Atomic read + call reservation eliminates validation-versus-expiry TOCTOU. */
-  public async begin(workspaceId: string, clientId: string, sessionId: string, callId: string, proof?: WorkspaceWriterLeaseProof): Promise<Result<{ required: boolean; generation: number }>> {
+  public async begin(workspaceId: string, clientId: string, sessionId: string, callId: string, proof?: WorkspaceWriterLeaseProof, paths?: readonly string[]): Promise<Result<{ required: boolean; generation: number }>> {
     if (!validIdentity(workspaceId, clientId, sessionId) || !callId) return invalid();
     try {
+      const workspaceRoot = await this.globalExclusion?.resolveMutationRoot?.(workspaceId, paths);
       return this.transaction((db) => {
+        if (this.hasOverlappingWriter(db, workspaceId, workspaceRoot)) return conflict('An overlapping or unscoped workspace writer holds admission');
         const row = this.row(db, workspaceId);
         if (row === undefined || row.lease_id === null) {
           if (proof !== undefined) return conflict('No active workspace writer lease accepts this proof');
           const generation = row?.generation ?? 0;
-          db.prepare('INSERT INTO workspace_writer_calls(call_id,workspace_id,generation,pid) VALUES(?,?,?,?)')
-            .run(callId, workspaceId, generation, process.pid);
+          db.prepare('INSERT INTO workspace_writer_calls(call_id,workspace_id,generation,pid,workspace_root) VALUES(?,?,?,?,?)')
+            .run(callId, workspaceId, generation, process.pid, workspaceRoot ?? null);
           return ok({ required: false, generation });
         }
         if (row.expires_at <= this.now()) return conflict('Workspace lease expired; owner must renew or acquire a new fenced generation');
         if (proof === undefined || !matches(row, clientId, sessionId, proof)) return conflict('Workspace writer lease proof is missing, stale or belongs to another session');
-        db.prepare('INSERT INTO workspace_writer_calls(call_id,workspace_id,generation,pid) VALUES(?,?,?,?)')
-          .run(callId, workspaceId, row.generation, process.pid);
+        db.prepare('INSERT INTO workspace_writer_calls(call_id,workspace_id,generation,pid,workspace_root) VALUES(?,?,?,?,?)')
+          .run(callId, workspaceId, row.generation, process.pid, workspaceRoot ?? null);
         db.prepare('UPDATE workspace_writer_leases SET last_activity_at=? WHERE workspace_id=? AND generation=?')
           .run(this.now(), workspaceId, row.generation);
         return ok({ required: true, generation: row.generation });
@@ -218,6 +230,15 @@ export class SqliteWorkspaceWriterLease implements WorkspaceWriterLeasePort {
 
   private row(db: DatabaseSync, workspaceId: string): LeaseRow | undefined {
     return db.prepare('SELECT * FROM workspace_writer_leases WHERE workspace_id=?').get(workspaceId) as unknown as LeaseRow | undefined;
+  }
+
+  private hasOverlappingWriter(db: DatabaseSync, workspaceId: string, root: string | undefined): boolean {
+    if (this.globalExclusion?.resolveWorkspaceRoot === undefined) return false;
+    const leases = db.prepare('SELECT workspace_root FROM workspace_writer_leases WHERE workspace_id != ? AND lease_id IS NOT NULL AND expires_at > ?')
+      .all(workspaceId, this.now());
+    const calls = db.prepare('SELECT workspace_root,pid FROM workspace_writer_calls WHERE workspace_id != ?').all(workspaceId);
+    return [...leases, ...calls.filter((call) => typeof call.pid !== 'number' || processAlive(call.pid) !== 'dead')]
+      .some((writer) => workspaceRootsOverlap(root, typeof writer.workspace_root === 'string' ? writer.workspace_root : undefined));
   }
 
   private calls(db: DatabaseSync, workspaceId: string): CallRow[] {

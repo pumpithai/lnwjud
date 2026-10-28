@@ -250,12 +250,14 @@ export class FileService {
     actor: FileActor,
     workspaceId: string | undefined,
     mutation: () => Promise<Result<T>>,
+    paths?: readonly string[],
   ): Promise<Result<T>> {
     if (this.writerAdmission === undefined) return mutation();
     const admitted = await this.writerAdmission.enter({
       actorClientId: actor.clientId,
       workspaceId: workspaceId ?? 'implicit-workspace',
       kind: 'synchronous_mutation',
+      ...(paths === undefined ? {} : { paths }),
     });
     if (!admitted.ok) return admitted;
     try {
@@ -346,7 +348,7 @@ export class FileService {
   }
 
   public writeFile(actor: FileActor, workspaceId: string | undefined, request: WriteFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<WriteFileResult>> {
-    return this.withWriterAdmission(actor, workspaceId, () => this.writeFileInternal(actor, workspaceId, request, signal, authorization));
+    return this.withWriterAdmission(actor, workspaceId, () => this.writeFileInternal(actor, workspaceId, request, signal, authorization), [request?.path]);
   }
 
   private async writeFileInternal(actor: FileActor, workspaceId: string | undefined, request: WriteFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<WriteFileResult>> {
@@ -399,7 +401,7 @@ export class FileService {
   }
 
   public applyPatch(actor: FileActor, workspaceId: string | undefined, request: ApplyPatchRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<ApplyPatchResult>> {
-    return this.withWriterAdmission(actor, workspaceId, () => this.applyPatchInternal(actor, workspaceId, request, signal, authorization));
+    return this.withWriterAdmission(actor, workspaceId, () => this.applyPatchInternal(actor, workspaceId, request, signal, authorization), Array.isArray(request?.files) ? request.files.map((file) => file?.path) : undefined);
   }
 
   private async applyPatchInternal(actor: FileActor, workspaceId: string | undefined, request: ApplyPatchRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<ApplyPatchResult>> {
@@ -508,7 +510,7 @@ export class FileService {
   }
 
   public editFile(actor: FileActor, workspaceId: string | undefined, request: EditFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<EditFileResult>> {
-    return this.withWriterAdmission(actor, workspaceId, () => this.editFileInternal(actor, workspaceId, request, signal, authorization));
+    return this.withWriterAdmission(actor, workspaceId, () => this.editFileInternal(actor, workspaceId, request, signal, authorization), [request?.path]);
   }
 
   private async editFileInternal(actor: FileActor, workspaceId: string | undefined, request: EditFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<EditFileResult>> {
@@ -565,7 +567,7 @@ export class FileService {
   }
 
   public moveFile(actor: FileActor, workspaceId: string | undefined, request: MoveFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<void>> {
-    return this.withWriterAdmission(actor, workspaceId, () => this.moveFileInternal(actor, workspaceId, request, signal, authorization));
+    return this.withWriterAdmission(actor, workspaceId, () => this.moveFileInternal(actor, workspaceId, request, signal, authorization), [request?.sourcePath, request?.destinationPath]);
   }
 
   private async moveFileInternal(actor: FileActor, workspaceId: string | undefined, request: MoveFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<void>> {
@@ -594,7 +596,7 @@ export class FileService {
   }
 
   public copyFile(actor: FileActor, workspaceId: string | undefined, request: CopyFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<CopyFileResult>> {
-    return this.withWriterAdmission(actor, workspaceId, () => this.copyFileInternal(actor, workspaceId, request, signal, authorization));
+    return this.withWriterAdmission(actor, workspaceId, () => this.copyFileInternal(actor, workspaceId, request, signal, authorization), [request?.sourcePath, request?.destinationPath]);
   }
 
   private async copyFileInternal(actor: FileActor, workspaceId: string | undefined, request: CopyFileRequest, signal?: AbortSignal, authorization?: InvocationAuthorization): Promise<Result<CopyFileResult>> {

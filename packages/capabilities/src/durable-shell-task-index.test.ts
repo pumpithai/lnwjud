@@ -17,6 +17,22 @@ afterEach(async () => {
 });
 
 describe('DurableShellTaskIndex', () => {
+  it('retains canonical scope across index restart and rejects changed-scope attachment', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-scope-index-'));
+    temporaryRoots.push(root);
+    const options = { maxConcurrentTasks: 10, inspectTask: async (): Promise<'unknown'> => 'unknown' };
+    const first = new DurableShellTaskIndex(root, options);
+    const owned = { taskId: 'scoped-writer', requestDigest: 'a'.repeat(64), ownerClientId: 'one', mutationKind: 'opaque' as const, workspaceRoot: path.join(root, 'a') };
+    expect(await first.reserve(owned)).toMatchObject({ ok: true });
+    const restarted = new DurableShellTaskIndex(root, options);
+    expect(await restarted.reserve({ ...owned, workspaceRoot: path.join(root, 'b') })).toMatchObject({ ok: false });
+    const independent = { taskId: 'independent', requestDigest: 'b'.repeat(64), ownerClientId: 'two', mutationKind: 'workspace_probe' as const, workspaceRoot: path.join(root, 'b') };
+    expect(await restarted.reserve(independent)).toMatchObject({ ok: true });
+    expect(await restarted.reserve({ ...independent, taskId: 'child', workspaceRoot: path.join(root, 'a', 'child') })).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    await restarted.release(owned.taskId, owned.requestDigest);
+    expect(await restarted.reserve({ ...independent, taskId: 'after', workspaceRoot: path.join(root, 'a') })).toMatchObject({ ok: true });
+  });
+
   it('does not allow a different client or workspace to attach to another import reservation', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lnwjud-import-owner-'));
     temporaryRoots.push(root);

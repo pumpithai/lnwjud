@@ -501,7 +501,8 @@ export function createDesktopRuntime(dataPath: string, options: DesktopRuntimeOp
     console.error(`Automatic database backup failed: ${error instanceof Error ? error.message : 'unknown error'}`);
   });
   const workspaceService = new WorkspaceService(workspaceRepository);
-  const writerAdmission = new SharedManagedWriterAdmission(path.join(dataPath, 'background-tasks'));
+  const writerAdmission = new SharedManagedWriterAdmission(path.join(dataPath, 'background-tasks'), async (id) =>
+    (await workspaceRepository.get(id))?.realRootPath);
   const gitService = new GitService(workspaceRepository, undefined, undefined, { writerAdmission, nativeContainmentRoot: path.join(dataPath, 'native-managed-git') });
   const codexDiscovery = new CodexDiscovery();
   const executableResolver = new PathExecutableResolver();

@@ -1,3 +1,7 @@
+> **Maintained fork:** [pumpithai/lnwjud](https://github.com/pumpithai/lnwjud/tree/dev).
+> The `dev` branch retains the writer-lease lifecycle, idle recovery and scoped workspace admission fixes.
+> See [fork maintenance](docs/FORK_MAINTENANCE.md) before importing upstream changes or building an update.
+
 <p align="center">
   <img src="assets/logo/logo-256x256.png" width="160" alt="lnwjud logo" />
 </p>

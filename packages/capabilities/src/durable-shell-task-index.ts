@@ -3,12 +3,15 @@ import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, writeFile
 import path from 'node:path';
 import { readWindowsContainmentReceipt } from '@lnwjud/process';
 import { appError, err, ok, type Result } from '@lnwjud/domain';
+import { workspaceRootsOverlap } from './workspace-write-scope.js';
 
 export type ActiveTaskInspection = 'active' | 'terminal' | 'missing' | 'unknown';
 
-export type DurableMutationKind = 'opaque' | 'repository_import' | 'opaque_uncontained' | 'opaque_contained_process';
+export type DurableMutationKind = 'opaque' | 'repository_import' | 'opaque_uncontained' | 'opaque_contained_process' | 'workspace_probe';
 
 export interface DurableTaskReservation {
+  /** Canonical root verified by the host; never accepted from MCP arguments. */
+  readonly workspaceRoot?: string;
   readonly mutationKind?: DurableMutationKind;
   readonly taskId: string;
   readonly requestDigest: string;
@@ -77,7 +80,8 @@ export class DurableShellTaskIndex {
   }
 
   public async reserve(input: DurableTaskReservation): Promise<Result<DurableTaskReservationResult>> {
-    if ((input.mutationKind !== undefined && input.mutationKind !== 'opaque' && input.mutationKind !== 'repository_import' && input.mutationKind !== 'opaque_uncontained' && input.mutationKind !== 'opaque_contained_process')
+    if ((input.mutationKind !== undefined && input.mutationKind !== 'opaque' && input.mutationKind !== 'repository_import' && input.mutationKind !== 'opaque_uncontained' && input.mutationKind !== 'opaque_contained_process' && input.mutationKind !== 'workspace_probe')
+      || (input.workspaceRoot !== undefined && (!path.isAbsolute(input.workspaceRoot) || input.workspaceRoot.includes('\0') || (input.mutationKind !== 'workspace_probe' && input.mutationKind !== 'opaque')))
       || (input.mutationKind === 'opaque_contained_process' && (typeof input.nativeReceiptPath !== 'string' || !path.isAbsolute(input.nativeReceiptPath)))
       || !isSafeTaskId(input.taskId)
       || !/^[a-f0-9]{64}$/i.test(input.requestDigest)
@@ -95,7 +99,7 @@ export class DurableShellTaskIndex {
           if (marker.record?.taskId === input.taskId) {
             if (marker.record.requestDigest !== input.requestDigest || marker.record.mutationKind !== (input.mutationKind ?? 'opaque')
               || marker.record.ownerClientId !== input.ownerClientId
-              || marker.record.ownerWorkspaceId !== input.ownerWorkspaceId) {
+              || marker.record.ownerWorkspaceId !== input.ownerWorkspaceId || marker.record.workspaceRoot !== input.workspaceRoot) {
               return err(appError('CONFLICT', 'Durable task ID is already reserved for another request', true));
             }
             return ok({ activeTasks: activeTasks + 1, created: false, markerPath: marker.path });
@@ -103,6 +107,9 @@ export class DurableShellTaskIndex {
           if (marker.record === undefined) {
             return err(appError('CONFLICT', 'A managed writer reservation is unreadable; resolve its state before launching another writer', true));
           }
+          const scopedConflict = (input.mutationKind === 'workspace_probe' || marker.record.mutationKind === 'workspace_probe'
+            || input.workspaceRoot !== undefined || marker.record.workspaceRoot !== undefined)
+            && workspaceRootsOverlap(input.workspaceRoot, marker.record.workspaceRoot);
           if (marker.record.mutationKind === 'opaque_contained_process') {
             const native = marker.record.nativeReceiptPath === undefined
               ? undefined : await readWindowsContainmentReceipt(marker.record.nativeReceiptPath);
@@ -110,7 +117,7 @@ export class DurableShellTaskIndex {
               await rm(marker.path, { force: true }).catch(() => undefined);
               continue;
             }
-            if (input.mutationKind === 'repository_import') {
+            if (input.mutationKind === 'repository_import' || scopedConflict) {
               return err(appError('CONFLICT', 'Unverified native process descendants block repository import', true));
             }
             activeTasks += 1;
@@ -122,8 +129,10 @@ export class DurableShellTaskIndex {
             await rm(marker.path, { force: true }).catch(() => undefined);
             continue;
           }
-          if (input.mutationKind === 'repository_import' || marker.record.mutationKind === 'repository_import') {
-            return err(appError('CONFLICT', 'Repository import requires exclusive managed writer admission; a live or unresolved task holds it', true));
+          if (input.mutationKind === 'repository_import' || marker.record.mutationKind === 'repository_import' || scopedConflict) {
+            return err(appError('CONFLICT', scopedConflict
+              ? 'Workspace writer admission conflicts with overlapping or unscoped managed work'
+              : 'Repository import requires exclusive managed writer admission; a live or unresolved task holds it', true));
           }
           activeTasks += 1;
         }
@@ -142,6 +151,7 @@ export class DurableShellTaskIndex {
           mutationKind: input.mutationKind ?? 'opaque',
           ...(input.nativeReceiptPath === undefined ? {} : { nativeReceiptPath: input.nativeReceiptPath }),
           ownerClientId: input.ownerClientId,
+          ...(input.workspaceRoot === undefined ? {} : { workspaceRoot: input.workspaceRoot }),
           ...(input.ownerWorkspaceId === undefined ? {} : { ownerWorkspaceId: input.ownerWorkspaceId }),
           reservedAt: this.now().toISOString(),
           launcherPid: process.pid,
@@ -404,6 +414,7 @@ export class DurableShellTaskIndex {
 }
 
 interface MarkerRecord {
+  readonly workspaceRoot?: string;
   readonly version: 1;
   readonly taskId: string;
   readonly requestDigest: string | null;
@@ -451,13 +462,15 @@ async function isReady(filename: string): Promise<boolean> {
 async function readMarker(filename: string): Promise<MarkerRecord | undefined> {
   const value = await readJson(filename);
   if (!isRecord(value) || value.version !== 1 || typeof value.taskId !== 'string') return undefined;
-  if (value.mutationKind !== undefined && value.mutationKind !== 'opaque' && value.mutationKind !== 'repository_import' && value.mutationKind !== 'opaque_uncontained' && value.mutationKind !== 'opaque_contained_process') return undefined;
+  if (value.mutationKind !== undefined && value.mutationKind !== 'opaque' && value.mutationKind !== 'repository_import' && value.mutationKind !== 'opaque_uncontained' && value.mutationKind !== 'opaque_contained_process' && value.mutationKind !== 'workspace_probe') return undefined;
+  if (value.workspaceRoot !== undefined && (typeof value.workspaceRoot !== 'string' || !path.isAbsolute(value.workspaceRoot) || value.workspaceRoot.includes('\0') || (value.mutationKind !== 'workspace_probe' && value.mutationKind !== 'opaque'))) return undefined;
   if (value.requestDigest !== null && (typeof value.requestDigest !== 'string' || !/^[a-f0-9]{64}$/i.test(value.requestDigest))) return undefined;
   return {
     version: 1,
     taskId: value.taskId,
     requestDigest: value.requestDigest,
-    mutationKind: value.mutationKind === 'repository_import' ? 'repository_import' : value.mutationKind === 'opaque_uncontained' ? 'opaque_uncontained' : value.mutationKind === 'opaque_contained_process' ? 'opaque_contained_process' : 'opaque',
+    mutationKind: value.mutationKind === 'workspace_probe' ? 'workspace_probe' : value.mutationKind === 'repository_import' ? 'repository_import' : value.mutationKind === 'opaque_uncontained' ? 'opaque_uncontained' : value.mutationKind === 'opaque_contained_process' ? 'opaque_contained_process' : 'opaque',
+    ...(typeof value.workspaceRoot === 'string' ? { workspaceRoot: value.workspaceRoot } : {}),
     ...(typeof value.ownerClientId === 'string' ? { ownerClientId: value.ownerClientId } : {}),
     ...(typeof value.ownerWorkspaceId === 'string' ? { ownerWorkspaceId: value.ownerWorkspaceId } : {}),
     ...(typeof value.nativeReceiptPath === 'string' && path.isAbsolute(value.nativeReceiptPath) ? { nativeReceiptPath: value.nativeReceiptPath } : {}),

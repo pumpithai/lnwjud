@@ -14,6 +14,7 @@ import { GoalRequestCancellationService, RepositoryImportService } from '@lnwjud
 import { CODEX_TOOL_NAMES } from './tools/codex-tools.js';
 import { AUTOMATION_TOOL_NAMES } from './tools/automation-tools.js';
 import { isAdvertisedDeliveryState } from './tool-delivery-contract.js';
+import { workspaceWriterLeaseProofSchema } from './tools/schemas.js';
 import { UPGRADE_TOOL_CATALOG } from './upgrade-catalog.js';
 
 const actor = { clientId: 'client-1', clientName: 'test' };
@@ -109,25 +110,40 @@ describe('MCP tool registry', () => {
       });
       const first = new ToolRegistry({ file, workspaceWriterLease: lease }, actor, opts('session-a'));
       const other = new ToolRegistry({ file, workspaceWriterLease: lease }, { clientId: 'client-other', clientName: 'other' }, opts('session-b'));
-      const acquired = await lease.acquire('workspace-a', actor.clientId, 'session-a', 120);
-      expect(acquired.ok).toBe(true);
-      if (!acquired.ok) return;
+      const acquired = await first.invoke('workspace_writer_lease_acquire', { workspaceId: 'workspace-a', ttlSeconds: 120 });
+      expect(acquired.isError).not.toBe(true);
+      const proof = workspaceWriterLeaseProofSchema.parse(acquired.structuredContent);
+      const control = { workspaceId: 'workspace-a', writerLease: proof };
+      expect((await first.invoke('workspace_writer_lease_renew', control)).isError).not.toBe(true);
+      expect(await other.invoke('workspace_writer_lease_release', control))
+        .toMatchObject({ isError: true, structuredContent: { error: { code: 'CONFLICT' } } });
+      expect(await first.invoke('workspace_writer_lease_release', { ...control, writerLease: { ...proof, leaseToken: 'wrong-token' } }))
+        .toMatchObject({ isError: true, structuredContent: { error: { code: 'CONFLICT' } } });
       const request = { workspaceId: 'workspace-a', path: 'file.ts', oldText: 'a', newText: 'b' };
       expect(await other.invoke('edit_file', request)).toMatchObject({ isError: true, structuredContent: { error: { code: 'CONFLICT' } } });
       expect(await first.invoke('edit_file', request)).toMatchObject({ isError: true, structuredContent: { error: { code: 'CONFLICT' } } });
       expect(edits).toEqual([]);
-      const allowed = await first.invoke('edit_file', { ...request, writerLease: acquired.value });
+      const allowed = await first.invoke('edit_file', { ...request, writerLease: proof });
       if (allowed.isError) throw new Error(JSON.stringify(allowed));
       expect(edits).toEqual([actor.clientId]);
-      expect(await lease.release('workspace-a', actor.clientId, 'session-a', acquired.value)).toMatchObject({ ok: true });
+      expect((await first.invoke('workspace_writer_lease_release', control)).isError).not.toBe(true);
+      expect(await first.invoke('workspace_writer_lease_status', { workspaceId: 'workspace-a' }))
+        .toMatchObject({ structuredContent: { state: 'unleased', activeCalls: 0 } });
       expect((await other.invoke('edit_file', request)).isError).not.toBe(true);
       expect(edits).toEqual([actor.clientId, 'client-other']);
+      const next = await other.invoke('workspace_writer_lease_acquire', { workspaceId: 'workspace-a', ttlSeconds: 120 });
+      expect(next.isError).not.toBe(true);
+      const nextProof = workspaceWriterLeaseProofSchema.parse(next.structuredContent);
+      expect(nextProof.generation).toBe(proof.generation + 1);
+      expect(await first.invoke('workspace_writer_lease_release', control))
+        .toMatchObject({ isError: true, structuredContent: { error: { code: 'CONFLICT' } } });
+      expect((await other.invoke('workspace_writer_lease_release', { workspaceId: 'workspace-a', writerLease: nextProof })).isError).not.toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it('requires explicit confirmation when the same client recovers an idle older MCP session', async () => {
+  it.each(['old-session', 'new-session'])('requires explicit confirmation when the same client recovers idle %s', async (sessionId) => {
     const root = await mkdtemp(path.join(tmpdir(), 'lnwjud-mcp-recover-fence-'));
     try {
       let time = 100_000;
@@ -135,7 +151,7 @@ describe('MCP tool registry', () => {
       const first = await lease.acquire('workspace-a', actor.clientId, 'old-session', 600);
       if (!first.ok) throw new Error('lease setup failed');
       const registry = new ToolRegistry({ workspaceWriterLease: lease }, actor, {
-        sessionId: 'new-session',
+        sessionId,
         profileProvider: (): typeof permissionProfiles.full => permissionProfiles.full,
         authorizationModeProvider: (): 'full_bypass' => 'full_bypass',
       });

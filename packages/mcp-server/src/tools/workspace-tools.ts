@@ -43,7 +43,7 @@ export function workspaceTools(context: McpToolContext): McpToolDefinition[] {
     }),
     defineTool({
       name: 'workspace_writer_lease_acquire',
-      description: 'Acquire a durable exclusive writer lease for one registered workspace. Explicit recoverAbandoned with user confirmation may fence an idle previous session of the same client after 60 seconds; unrelated clients and active/unknown writers remain blocked.',
+      description: 'Acquire a durable exclusive writer lease for one registered workspace. If proof was lost, explicit recoverAbandoned with user confirmation may fence an idle lease of the same client after 60 seconds, including the same stateless HTTP session. Recovery rotates the generation; old proofs become invalid. Unrelated clients and active/unknown writers remain blocked.',
       permission: 'WRITE', annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: workspaceWriterLeaseAcquireSchema,
       handler: async (input) => context.services.workspaceWriterLease === undefined ? missingService()
@@ -71,8 +71,11 @@ export function workspaceTools(context: McpToolContext): McpToolDefinition[] {
       description: 'Release an owned workspace writer lease only when no fenced invocation is active.',
       permission: 'WRITE', annotations: { readOnlyHint: false, destructiveHint: false },
       inputSchema: workspaceWriterLeaseProofActionSchema,
-      handler: async (input) => context.services.workspaceWriterLease === undefined ? missingService()
-        : context.services.workspaceWriterLease.release(input.workspaceId, context.actor.clientId, context.actor.sessionId ?? context.actor.clientId, input.writerLease),
+      handler: async (input) => {
+        if (context.services.workspaceWriterLease === undefined) return missingService();
+        const released = await context.services.workspaceWriterLease.release(input.workspaceId, context.actor.clientId, context.actor.sessionId ?? context.actor.clientId, input.writerLease);
+        return released.ok ? ok({ released: true }) : released;
+      },
     }),
     defineTool({
       name: 'workspace_register',

@@ -493,7 +493,9 @@ export class ToolRegistry {
       const goalLease = readGoalLeaseProof(parsed.value);
       const writerLease = readWorkspaceWriterLeaseProof(parsed.value);
       const engineeringTask = readEngineeringTaskBinding(parsed.value);
-      const parsedInput = stripEngineeringTaskEnvelope(stripGoalLeaseEnvelope(stripWorkspaceWriterLeaseEnvelope(parsed.value)));
+      const parsedInput = stripEngineeringTaskEnvelope(stripGoalLeaseEnvelope(
+        WORKSPACE_WRITER_LEASE_CONTROL_TOOLS.has(tool.name) ? parsed.value : stripWorkspaceWriterLeaseEnvelope(parsed.value),
+      ));
       const goalBound = bindInvocationToGoal(tool.name, parsedInput, goalLease);
       if (!goalBound.ok) {
         await this.activity.end(callId, goalBound.error.code, Date.now() - started, goalBound.error.message);
@@ -696,6 +698,7 @@ export class ToolRegistry {
           this.sessionId ?? this.actor.sessionId ?? this.actor.clientId,
           callId,
           writerLease,
+          boundedWriterPaths(tool.name, approvalExecutionInput),
         );
         if (!admitted.ok) {
           await this.activity.end(callId, admitted.error.code, Date.now() - started, admitted.error.message);
@@ -1289,6 +1292,23 @@ function normalizedActivityPath(value: string): string {
 
 function readTrimmedString(value: unknown): string | undefined { return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
+
+function boundedWriterPaths(name: string, input: unknown): readonly string[] | undefined {
+  if (!isRecord(input)) return undefined;
+  if ((name === 'write_file' || name === 'edit_file') && typeof input.path === 'string') return [input.path];
+  if ((name === 'move_file' || name === 'copy_file') && typeof input.sourcePath === 'string' && typeof input.destinationPath === 'string') {
+    return [input.sourcePath, input.destinationPath];
+  }
+  if (name === 'apply_patch' && Array.isArray(input.files) && input.files.length > 0) {
+    const paths: string[] = [];
+    for (const file of input.files) {
+      if (!isRecord(file) || typeof file.path !== 'string') return undefined;
+      paths.push(file.path);
+    }
+    return paths;
+  }
+  return undefined;
+}
 function rememberBounded(map: Map<string, string>, key: string, value: string, max: number): void {
   if (map.has(key)) map.delete(key);
   map.set(key, value);

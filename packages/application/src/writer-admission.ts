@@ -12,5 +12,7 @@ export interface ManagedWriterAdmissionPort {
     readonly workspaceId: string;
     readonly kind: 'synchronous_mutation' | 'uncontained_process' | 'contained_process';
     readonly nativeReceiptPath?: string;
+    /** File-operation targets, checked against the registered canonical root by the host. */
+    readonly paths?: readonly string[];
   }): Promise<Result<ManagedWriterAdmissionLease>>;
 }

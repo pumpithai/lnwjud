@@ -66,6 +66,7 @@ docs/
 docs/*
 !docs/CHATGPT_LONG_SESSION.md
 !docs/USAGE_TH.md
+!docs/FORK_MAINTENANCE.md
 !docs/mcp/
 docs/mcp/*
 !docs/mcp/MCP_TASKS.md

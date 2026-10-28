@@ -104,38 +104,41 @@ describe('durable multi-session workspace writer lease', () => {
       .toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
   });
 
-  it('recovers an idle same-client session after grace and revokes stale proof', async () => {
+  it.each(['old-session', 'new-session'])('recovers idle same-client %s after grace and revokes stale proof', async (recoverySession) => {
     let time = 100_000;
     const { one, two } = await fixture(() => time);
     const first = await one.acquire('workspace', 'owner', 'old-session', 600);
     if (!first.ok) throw new Error('unexpected lease failure');
     expect(await two.acquire('workspace', 'owner', 'new-session', 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await two.acquire('workspace', 'owner', 'old-session', 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
     time += 61_000;
     expect(await two.acquire('workspace', 'other-owner', 'new-session', 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
     expect(await two.acquire('workspace', 'owner', 'new-session', 600)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
-    expect(await two.acquire('workspace', 'owner', 'old-session', 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
-    const second = await two.acquire('workspace', 'owner', 'new-session', 600, true);
+    const second = await two.acquire('workspace', 'owner', recoverySession, 600, true);
     expect(second.ok).toBe(true);
     if (!second.ok) return;
     expect(second.value.generation).toBe(first.value.generation + 1);
     expect(await one.begin('workspace', 'owner', 'old-session', 'stale', first.value)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
     expect(await one.release('workspace', 'owner', 'old-session', first.value)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
-    expect(await two.begin('workspace', 'owner', 'new-session', 'new-call', second.value)).toMatchObject({ ok: true });
+    expect(await one.renew('workspace', 'owner', 'old-session', first.value, 600)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await two.begin('workspace', 'owner', recoverySession, 'new-call', second.value)).toMatchObject({ ok: true });
     await two.end('workspace', 'new-call', second.value.generation);
+    expect(await two.release('workspace', 'owner', recoverySession, second.value)).toMatchObject({ ok: true });
+    expect(await one.inspect('workspace')).toMatchObject({ ok: true, value: { state: 'unleased', activeCalls: 0 } });
   });
 
-  it('blocks an active writer and waits another grace interval after it finishes', async () => {
+  it.each(['old-session', 'new-session'])('blocks an active writer during %s recovery and waits another grace interval after it finishes', async (recoverySession) => {
     let time = 100_000;
     const { one, two } = await fixture(() => time);
     const owned = await one.acquire('workspace', 'owner', 'old-session', 600);
     if (!owned.ok) throw new Error('lease not acquired');
     expect(await one.begin('workspace', 'owner', 'old-session', 'active-call', owned.value)).toMatchObject({ ok: true });
     time += 61_000;
-    expect(await two.acquire('workspace', 'owner', 'new-session', 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await two.acquire('workspace', 'owner', recoverySession, 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
     await one.end('workspace', 'active-call', owned.value.generation);
-    expect(await two.acquire('workspace', 'owner', 'new-session', 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
+    expect(await two.acquire('workspace', 'owner', recoverySession, 600, true)).toMatchObject({ ok: false, error: { code: 'CONFLICT' } });
     time += 61_000;
-    expect(await two.acquire('workspace', 'owner', 'new-session', 600, true)).toMatchObject({ ok: true, value: { generation: 2 } });
+    expect(await two.acquire('workspace', 'owner', recoverySession, 600, true)).toMatchObject({ ok: true, value: { generation: 2 } });
   });
 
   it('only grants one recovery when two same-client sessions race', async () => {
