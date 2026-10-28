@@ -42,6 +42,7 @@ Use the repository's Node 24 toolchain and pinned pnpm version:
 
 ```sh
 NODE_OPTIONS=--conditions=development corepack pnpm@10.15.0 exec vitest run packages/capabilities/src/shared-managed-writer-admission.test.ts packages/capabilities/src/durable-shell-task-index.test.ts packages/capabilities/src/durable-shell-task-store.test.ts packages/capabilities/src/workspace-writer-lease.test.ts packages/application/src/file-service-write.test.ts packages/application/src/file-service.test.ts packages/application/src/process-service.test.ts packages/application/src/git-service.test.ts packages/mcp-server/src/tool-registry.test.ts packages/mcp-server/src/workspace-writer-lease-http.integration.test.ts tests/integration/process-writer-admission.test.ts
+corepack pnpm@10.15.0 --filter @lnwjud/desktop exec vitest run --config vitest.config.ts tests/multi-workspace-concurrency-acceptance.test.ts tests/native-crash-diagnostics.test.ts
 corepack pnpm@10.15.0 --filter @lnwjud/capabilities build
 corepack pnpm@10.15.0 --filter @lnwjud/application build
 corepack pnpm@10.15.0 --filter @lnwjud/mcp-server build

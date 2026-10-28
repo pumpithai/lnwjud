@@ -191,16 +191,15 @@ describe('multi-workspace concurrency acceptance', () => {
         enabled: true,
         policy: { approvals: { delete_file: true } },
       });
-      const [crossDeleteA, crossDeleteB] = await Promise.all([
-        clientA.callTool({
-          name: 'delete_file',
-          arguments: { workspaceId: workspaceA.id, path: path.join(workspaceRootB, 'victim-b.txt') },
-        }),
-        clientB.callTool({
-          name: 'delete_file',
-          arguments: { workspaceId: workspaceB.id, path: path.join(workspaceRootA, 'victim-a.txt') },
-        }),
-      ]);
+      // Cross-root mutations have unknown scope and must not overlap.
+      const crossDeleteA = await clientA.callTool({
+        name: 'delete_file',
+        arguments: { workspaceId: workspaceA.id, path: path.join(workspaceRootB, 'victim-b.txt') },
+      });
+      const crossDeleteB = await clientB.callTool({
+        name: 'delete_file',
+        arguments: { workspaceId: workspaceB.id, path: path.join(workspaceRootA, 'victim-a.txt') },
+      });
       expect(crossDeleteA.isError, JSON.stringify(crossDeleteA)).not.toBe(true);
       expect(crossDeleteB.isError, JSON.stringify(crossDeleteB)).not.toBe(true);
       await expect(access(path.join(workspaceRootA, 'victim-a.txt'))).rejects.toThrow();
